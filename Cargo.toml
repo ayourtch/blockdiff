@@ -1,0 +1,9 @@
+[package]
+name = "blockdiff"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fiemap = "0.1.1"
+nix = "0.26.0"
+
