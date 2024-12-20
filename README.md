@@ -4,6 +4,14 @@ Fast block-level file diffs (e.g. for VM disk images) using CoW filesystem metad
 
 ## Usage
 
+Creating a snapshot:
+
 ```
-blockdiff source.img base.img output.bdiff
+blockdiff create target.img base.img output.bdiff
+```
+
+Applying a snapshot:
+
+```
+blockdiff apply target.img base.img input.bdiff
 ```
