@@ -1,8 +1,37 @@
-use std::env::args;
-use std::io::{Error, Write};
+use clap::{Parser, Subcommand};
+use std::io::{Error, Write, Read};
 use std::fs::File;
 use nix::fcntl::copy_file_range;
 use std::os::fd::AsRawFd;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Create a block-level diff between two files
+    Create {
+        /// Path to the target file to diff
+        target_file: String,
+        /// Path to the base file to compare against
+        base_file: String,
+        /// Path where to write the bdiff output
+        bdiff_output: String,
+    },
+    /// Apply a block-level diff to create a new file
+    Apply {
+        /// Path where to create the target file
+        target_file: String,
+        /// Path to the base file
+        base_file: String,
+        /// Path to the bdiff file to apply
+        bdiff_input: String,
+    },
+}
 
 // Represents a range in the target file that's different from the base file (as indicated by the CoW metadata)
 #[derive(Debug)]
@@ -42,30 +71,22 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn get_different_ranges(target_path: &str, base_path: &str) -> Result<Vec<DiffRange>, Error> {
+fn get_different_ranges(target_file: &str, base_file: &str) -> Result<Vec<DiffRange>, Error> {
     let mut diff_ranges = Vec::new();
     
     // Get fiemaps for both files, sorted by logical offset
-    let mut target_extents: Vec<_> = fiemap::fiemap(target_path)?.collect::<Result<Vec<_>, _>>()?;
-    let mut base_extents: Vec<_> = fiemap::fiemap(base_path)?.collect::<Result<Vec<_>, _>>()?;
+    let mut target_extents: Vec<_> = fiemap::fiemap(target_file)?.collect::<Result<Vec<_>, _>>()?;
+    let mut base_extents: Vec<_> = fiemap::fiemap(base_file)?.collect::<Result<Vec<_>, _>>()?;
     target_extents.sort_by_key(|e| e.fe_logical);
     base_extents.sort_by_key(|e| e.fe_logical);
 
-    println!("target_extents:");
-    for extent in &target_extents {
-        println!("  {:?}", extent);
-    }
     // Total size of target file
-    let total_size = target_extents.last().unwrap().fe_logical + target_extents.last().unwrap().fe_length;
-    println!("Total size of target file: {}", format_size(total_size));
+    let total_size: u64 = target_extents.iter().map(|e| e.fe_length).sum();
+    println!("Size of target file: {}", format_size(total_size));
 
-    println!("base_extents:");
-    for extent in &base_extents {
-        println!("  {:?}", extent);
-    }
     // Total size of base file
-    let total_size = base_extents.last().unwrap().fe_logical + base_extents.last().unwrap().fe_length;
-    println!("Total size of base file: {}", format_size(total_size));
+    let total_size: u64 = base_extents.iter().map(|e| e.fe_length).sum();
+    println!("Size of base file: {}", format_size(total_size));
 
     // A helper closure for getting the end of any extent quickly
     let extent_end = |e: &fiemap::FiemapExtent| e.fe_logical + e.fe_length;
@@ -152,34 +173,18 @@ fn get_different_ranges(target_path: &str, base_path: &str) -> Result<Vec<DiffRa
     Ok(diff_ranges)
 }
 
-fn main() -> Result<(), Error> {
-    // Parse command line args
-    let args: Vec<String> = args().collect();
-    if args.len() != 4 {
-        eprintln!("Usage: {} <target_file> <base_file> <bdiff_output_file>", args[0]);
-        std::process::exit(1);
-    }
-
-    let target_path = &args[1];
-    let base_path = &args[2];
-    let diff_output_path = &args[3];
-
+fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result<(), Error> {
     // 1) Open the target file so we can copy bytes from it later
-    let target = File::open(target_path)?;
+    let target = File::open(target_file)?;
 
     // 2) Compute the diff ranges.
-    let diff_ranges = get_different_ranges(target_path, base_path)?;
+    let diff_ranges = get_different_ranges(target_file, base_file)?;
 
-    println!("diff_ranges:");
-    let mut total_size = 0;
-    for range in &diff_ranges {
-        println!("  {:?}", range);
-        total_size += range.length;
-    }
-    println!("Total size of diff ranges: {}", format_size(total_size));
+    let total_size: u64 = diff_ranges.iter().map(|range| range.length).sum();
+    println!("Size of blockdiff: {}", format_size(total_size));
 
     // 3) Create the bdiff file
-    let mut diff_out = File::create(diff_output_path)?;
+    let mut diff_out = File::create(bdiff_output)?;
 
     // 4) Write the header.
     let magic = b"BDIFFv1\0"; // 8 bytes
@@ -207,16 +212,103 @@ fn main() -> Result<(), Error> {
         )
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
 
-        if copied == 0 {
-            return Err(Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Failed to copy all requested bytes"
-            ));
+        if copied != range.length as usize {
+            return Err(Error::new(std::io::ErrorKind::UnexpectedEof, format!("Failed to copy all requested bytes for range {:?}: copied {} bytes, expected {}", range, copied, range.length)));
         }
     }
 
-    // Ensure all data is written to disk
-    diff_out.sync_all()?;
+    println!("Successfully created blockdiff file at {}", bdiff_output);
 
     Ok(())
+}
+
+fn apply_diff(target_file: &str, base_file: &str, bdiff_input: &str) -> Result<(), Error> {
+    // First, create a reflink copy of the base file as our target
+    let src = File::open(base_file)?;
+    let dst = File::create(target_file)?;
+    let total_len = src.metadata()?.len() as usize;
+    let mut copied_total = 0;
+    while copied_total < total_len {
+        let copied = copy_file_range(
+            src.as_raw_fd(),
+            None,
+            dst.as_raw_fd(),
+            None,
+            total_len - copied_total
+        ).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        
+        if copied == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("Failed to create target file {} as copy of base file {}: copied {} bytes, expected {}", 
+                    target_file, base_file, copied_total, total_len)
+            ));
+        }
+        
+        copied_total += copied;
+    }
+
+    println!("Created target file at {}", target_file);
+    
+    // Open the diff file
+    let mut diff_in = File::open(bdiff_input)?;
+    let target = File::options().write(true).open(target_file)?;
+    
+    // Read and verify magic
+    let mut magic = [0u8; 8];
+    diff_in.read_exact(&mut magic)?;
+    if magic != *b"BDIFFv1\0" {
+        return Err(Error::new(std::io::ErrorKind::InvalidData, "Invalid bdiff file format"));
+    }
+    
+    // Read number of ranges
+    let mut num_ranges = [0u8; 8];
+    diff_in.read_exact(&mut num_ranges)?;
+    let num_ranges = u64::from_le_bytes(num_ranges);
+    
+    // Read all range headers
+    let mut ranges = Vec::with_capacity(num_ranges as usize);
+    for _ in 0..num_ranges {
+        let mut offset = [0u8; 8];
+        let mut length = [0u8; 8];
+        diff_in.read_exact(&mut offset)?;
+        diff_in.read_exact(&mut length)?;
+        ranges.push(DiffRange {
+            logical_offset: u64::from_le_bytes(offset),
+            length: u64::from_le_bytes(length),
+        });
+    }
+    
+    // Apply each range
+    for range in ranges {
+        let mut off_out = range.logical_offset as i64;
+        let copied = copy_file_range(
+            diff_in.as_raw_fd(),
+            None,
+            target.as_raw_fd(),
+            Some(&mut off_out),
+            range.length as usize,
+        ).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        
+        if copied != range.length as usize {
+            return Err(Error::new(std::io::ErrorKind::UnexpectedEof, format!("Failed to copy all requested bytes for range {:?}: copied {} bytes, expected {}", range, copied, range.length)));
+        }
+    }
+
+    println!("Successfully applied {} to target file", bdiff_input);
+    
+    Ok(())
+}
+
+fn main() -> Result<(), Error> {
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Commands::Create { target_file, base_file, bdiff_output } => {
+            create_diff(target_file, base_file, bdiff_output)
+        }
+        Commands::Apply { target_file, base_file, bdiff_input } => {
+            apply_diff(target_file, base_file, bdiff_input)
+        }
+    }
 }
