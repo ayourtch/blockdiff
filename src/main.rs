@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
-use std::io::{Error, Write, Read};
+use std::io::{Error, Write, Read, Seek};
 use std::fs::File;
 use nix::fcntl::copy_file_range;
 use std::os::fd::AsRawFd;
+use nix::sys::statvfs::statvfs;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -40,13 +41,12 @@ struct DiffRange {
     length: u64,
 }
 
-// We'll define a simple file format:
+// We'll define a simple file format (.bdiff):
 // - 8 bytes: magic string b"BDIFFv1\0"
 // - 8 bytes (u64): number of diff ranges
 // - For each diff range: 16 bytes (two u64s: logical_offset, length)
+// - Padding to align with block boundary
 // - Followed by contiguous block data for each range
-//
-// We'll write the parser for this format later.
 
 fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
@@ -173,6 +173,12 @@ fn get_different_ranges(target_file: &str, base_file: &str) -> Result<Vec<DiffRa
     Ok(diff_ranges)
 }
 
+fn get_fs_block_size(path: &str) -> Result<usize, Error> {
+    let fs_stat = statvfs(path)
+        .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    Ok(fs_stat.block_size() as usize)
+}
+
 fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result<(), Error> {
     // 1) Open the target file so we can copy bytes from it later
     let target = File::open(target_file)?;
@@ -186,18 +192,25 @@ fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result
     // 3) Create the bdiff file
     let mut diff_out = File::create(bdiff_output)?;
 
-    // 4) Write the header.
+    // 4) Write the header with block alignment
     let magic = b"BDIFFv1\0"; // 8 bytes
     diff_out.write_all(magic)?;
     let num_ranges = diff_ranges.len() as u64;
     diff_out.write_all(&num_ranges.to_le_bytes())?;
 
-    // 5) Write each diff range's original offset/length as a header block.
-    //    Each range is 16 bytes: offset (u64), length (u64).
+    // Write all range headers
     for range in &diff_ranges {
         diff_out.write_all(&range.logical_offset.to_le_bytes())?;
         diff_out.write_all(&range.length.to_le_bytes())?;
     }
+
+    // Pad with zeros to align header to block boundary
+    // (This makes sure XFS can use reflink copies for the data blocks)
+    let block_size = get_fs_block_size(target_file)?;
+    let header_size = 8 + 8 + (diff_ranges.len() * 16); // magic + num_ranges + (offset + length) for each range
+    let padding_size = (block_size - (header_size % block_size)) % block_size;
+    let padding = vec![0u8; padding_size];
+    diff_out.write_all(&padding)?;
 
     // 6) Write all data blocks contiguously after the header.
     for range in &diff_ranges {
@@ -275,9 +288,16 @@ fn apply_diff(target_file: &str, base_file: &str, bdiff_input: &str) -> Result<(
         diff_in.read_exact(&mut length)?;
         ranges.push(DiffRange {
             logical_offset: u64::from_le_bytes(offset),
-            length: u64::from_le_bytes(length),
+            length: u64::from_le_bytes(length)
+            ,
         });
     }
+    
+    // Skip padding to align with block boundary
+    let block_size = get_fs_block_size(bdiff_input)?;
+    let header_size = 8 + 8 + (num_ranges as usize * 16); // magic + num_ranges + (offset + length) for each range
+    let padding_size = (block_size - (header_size % block_size)) % block_size;
+    diff_in.seek(std::io::SeekFrom::Current(padding_size as i64))?;
     
     // Apply each range
     for range in ranges {
