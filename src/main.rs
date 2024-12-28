@@ -16,21 +16,23 @@ struct Cli {
 enum Commands {
     /// Create a block-level diff between two files
     Create {
-        /// Path to the target file to diff
-        target_file: String,
-        /// Path to the base file to compare against
-        base_file: String,
         /// Path where to write the bdiff output
         bdiff_output: String,
+        /// Path to the target file to diff
+        target_file: String,
+        /// Path to the base file to compare against (optional)
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Apply a block-level diff to create a new file
     Apply {
-        /// Path where to create the target file
-        target_file: String,
-        /// Path to the base file
-        base_file: String,
         /// Path to the bdiff file to apply
         bdiff_input: String,
+        /// Path where to create the target file
+        target_file: String,
+        /// Path to the base file (optional)
+        #[arg(long)]
+        base: Option<String>,
     },
 }
 
@@ -116,13 +118,26 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn get_different_ranges(target_file: &str, base_file: &str) -> Result<Vec<DiffRange>, Error> {
+fn get_different_ranges(target_file: &str, base_file: Option<&str>) -> Result<Vec<DiffRange>, Error> {
     let mut diff_ranges = Vec::new();
     
-    // Get fiemaps for both files, sorted by logical offset
+    // Get fiemap for target file
     let mut target_extents: Vec<_> = fiemap::fiemap(target_file)?.collect::<Result<Vec<_>, _>>()?;
-    let mut base_extents: Vec<_> = fiemap::fiemap(base_file)?.collect::<Result<Vec<_>, _>>()?;
     target_extents.sort_by_key(|e| e.fe_logical);
+
+    // If no base file, return all non-empty extents
+    if base_file.is_none() {
+        for extent in target_extents {
+            diff_ranges.push(DiffRange {
+                logical_offset: extent.fe_logical,
+                length: extent.fe_length,
+            });
+        }
+        return Ok(diff_ranges);
+    }
+
+    // Get fiemap for base file
+    let mut base_extents: Vec<_> = fiemap::fiemap(base_file.unwrap())?.collect::<Result<Vec<_>, _>>()?;
     base_extents.sort_by_key(|e| e.fe_logical);
 
     // Total size of target file
@@ -263,10 +278,14 @@ fn copy_range(
     Ok(copied_total)
 }
 
-fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result<(), Error> {
+fn create_diff(bdiff_output: &str, target_file: &str, base_file: Option<&str>) -> Result<(), Error> {
     // 1) Open the target file so we can copy bytes from it later
     let target = File::open(target_file)?;
-    let base = File::open(base_file)?;
+    let base = if let Some(base) = base_file {
+        File::open(base)?
+    } else {
+        File::open(target_file)?
+    };
     let target_size = target.metadata()?.len();
     let base_size = base.metadata()?.len();
 
@@ -315,46 +334,54 @@ fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result
     Ok(())
 }
 
-fn apply_diff(target_file: &str, base_file: &str, bdiff_input: &str) -> Result<(), Error> {
-    // First, create a reflink copy of the base file as our target
-    let src = File::open(base_file)?;
+fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> Result<(), Error> {
+    // Open the diff file and read header
+    let mut diff_in = File::open(bdiff_input)?;
+    let header = BDiffHeader::read_from(&mut diff_in)?;
+
+    // Create target file (either as reflink copy of base or empty sparse file)
     let target = File::options()
         .write(true)
         .create(true)
         .open(target_file)?;
-    let total_len = src.metadata()?.len() as usize;
-    let copied = copy_range(
-        src.as_raw_fd(),
-        None,
-        target.as_raw_fd(),
-        None,
-        total_len
-    )?;
-    
-    if copied != total_len {
-        return Err(Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("Failed to create target file {} as copy of base file {}: copied {} bytes, expected {}", 
-                target_file, base_file, copied, total_len)
-        ));
+
+    if let Some(base) = base_file {
+        // Create as reflink copy of base
+        let src = File::open(base)?;
+        let total_len = src.metadata()?.len() as usize;
+        let copied = copy_range(
+            src.as_raw_fd(),
+            None,
+            target.as_raw_fd(),
+            None,
+            total_len
+        )?;
+        
+        if copied != total_len {
+            return Err(Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("Failed to create target file {} as copy of base file {}: copied {} bytes, expected {}", 
+                    target_file, base, copied, total_len)
+            ));
+        }
+
+        println!("Initialized target file as reflink copy of base file at: {}", target_file);
+
+        // Check if target size differs from base size and resize if needed
+        if header.target_size != header.base_size {
+            println!(
+                "Note: target file size differs from base file size: {} -> {}",
+                format_size(header.base_size),
+                format_size(header.target_size)
+            );
+            target.set_len(header.target_size)?;
+        }
+    } else {
+        // Create empty sparse file of target size
+        target.set_len(header.target_size)?;
+        println!("Initialized target file as empty sparse file of size {} at: {}", format_size(header.target_size), target_file);
     }
 
-    println!("Created target file at {}", target_file);
-    
-    // Open the diff file and read header
-    let mut diff_in = File::open(bdiff_input)?;
-    let header = BDiffHeader::read_from(&mut diff_in)?;
-    
-    // Check if target size differs from base size and resize if needed
-    if header.target_size != header.base_size {
-        println!(
-            "Note: target file size differs from base file size: {} -> {}",
-            format_size(header.base_size),
-            format_size(header.target_size)
-        );
-        target.set_len(header.target_size)?;
-    }
-    
     // Skip padding to align with block boundary
     let header_size = bincode::serialized_size(&header)
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))? as usize;
@@ -390,11 +417,11 @@ fn main() -> Result<(), Error> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Create { target_file, base_file, bdiff_output } => {
-            create_diff(target_file, base_file, bdiff_output)
+        Commands::Create { bdiff_output, target_file, base } => {
+            create_diff(bdiff_output, target_file, base.as_deref())
         }
-        Commands::Apply { target_file, base_file, bdiff_input } => {
-            apply_diff(target_file, base_file, bdiff_input)
+        Commands::Apply { bdiff_input, target_file, base } => {
+            apply_diff(bdiff_input, target_file, base.as_deref())
         }
     }
 }
