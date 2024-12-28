@@ -218,6 +218,50 @@ fn get_different_ranges(target_file: &str, base_file: &str) -> Result<Vec<DiffRa
     Ok(diff_ranges)
 }
 
+/// Copies all bytes from src_fd to dst_fd, handling partial copies and interrupts.
+/// Returns the total number of bytes copied.
+fn copy_range(
+    src_fd: std::os::unix::io::RawFd,
+    src_offset: Option<&mut i64>,
+    dst_fd: std::os::unix::io::RawFd,
+    dst_offset: Option<&mut i64>,
+    length: usize,
+) -> Result<usize, Error> {
+    let mut copied_total = 0;
+    
+    // Create local mutable copies of the offsets if they exist
+    let mut local_src_offset = src_offset.as_ref().map(|o| **o);
+    let mut local_dst_offset = dst_offset.as_ref().map(|o| **o);
+
+    while copied_total < length {
+        let copied = copy_file_range(
+            src_fd,
+            local_src_offset.as_mut(),
+            dst_fd,
+            local_dst_offset.as_mut(),
+            length - copied_total
+        ).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        
+        if copied == 0 {
+            return Err(Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("Unexpected EOF: copied {} bytes, expected {}", copied_total, length)
+            ));
+        }
+        
+        copied_total += copied;
+    }
+
+    // Update the original offsets with the final values
+    if let Some(src_off) = src_offset {
+        *src_off = local_src_offset.unwrap_or(*src_off);
+    }
+    if let Some(dst_off) = dst_offset {
+        *dst_off = local_dst_offset.unwrap_or(*dst_off);
+    }
+
+    Ok(copied_total)
+}
 
 fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result<(), Error> {
     // 1) Open the target file so we can copy bytes from it later
@@ -249,14 +293,13 @@ fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result
     for range in &header.ranges {
         let mut off_in = range.logical_offset as i64;
 
-        let copied = copy_file_range(
+        let copied = copy_range(
             target.as_raw_fd(),
             Some(&mut off_in),
             diff_out.as_raw_fd(),
-            None, // Write to the end of the file
+            None,
             range.length as usize,
-        )
-        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        )?;
 
         if copied != range.length as usize {
             return Err(Error::new(
@@ -275,27 +318,25 @@ fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result
 fn apply_diff(target_file: &str, base_file: &str, bdiff_input: &str) -> Result<(), Error> {
     // First, create a reflink copy of the base file as our target
     let src = File::open(base_file)?;
-    let dst = File::create(target_file)?;
+    let target = File::options()
+        .write(true)
+        .create(true)
+        .open(target_file)?;
     let total_len = src.metadata()?.len() as usize;
-    let mut copied_total = 0;
-    while copied_total < total_len {
-        let copied = copy_file_range(
-            src.as_raw_fd(),
-            None,
-            dst.as_raw_fd(),
-            None,
-            total_len - copied_total
-        ).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-        
-        if copied == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("Failed to create target file {} as copy of base file {}: copied {} bytes, expected {}", 
-                    target_file, base_file, copied_total, total_len)
-            ));
-        }
-        
-        copied_total += copied;
+    let copied = copy_range(
+        src.as_raw_fd(),
+        None,
+        target.as_raw_fd(),
+        None,
+        total_len
+    )?;
+    
+    if copied != total_len {
+        return Err(Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("Failed to create target file {} as copy of base file {}: copied {} bytes, expected {}", 
+                target_file, base_file, copied, total_len)
+        ));
     }
 
     println!("Created target file at {}", target_file);
@@ -304,25 +345,32 @@ fn apply_diff(target_file: &str, base_file: &str, bdiff_input: &str) -> Result<(
     let mut diff_in = File::open(bdiff_input)?;
     let header = BDiffHeader::read_from(&mut diff_in)?;
     
+    // Check if target size differs from base size and resize if needed
+    if header.target_size != header.base_size {
+        println!(
+            "Note: target file size differs from base file size: {} -> {}",
+            format_size(header.base_size),
+            format_size(header.target_size)
+        );
+        target.set_len(header.target_size)?;
+    }
+    
     // Skip padding to align with block boundary
     let header_size = bincode::serialized_size(&header)
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))? as usize;
     let padding_size = (BLOCK_SIZE - (header_size % BLOCK_SIZE)) % BLOCK_SIZE;
     diff_in.seek(std::io::SeekFrom::Current(padding_size as i64))?;
     
-    // Open target file for writing
-    let target = File::options().write(true).open(target_file)?;
-    
     // Apply each range
     for range in header.ranges {
         let mut off_out = range.logical_offset as i64;
-        let copied = copy_file_range(
+        let copied = copy_range(
             diff_in.as_raw_fd(),
             None,
             target.as_raw_fd(),
             Some(&mut off_out),
             range.length as usize,
-        ).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        )?;
         
         if copied != range.length as usize {
             return Err(Error::new(
