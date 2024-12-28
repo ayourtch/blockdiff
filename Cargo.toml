@@ -7,3 +7,5 @@ edition = "2021"
 fiemap = "0.1.1"
 nix = "0.26.0"
 clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"

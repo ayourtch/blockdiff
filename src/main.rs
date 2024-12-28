@@ -4,6 +4,7 @@ use std::fs::File;
 use nix::fcntl::copy_file_range;
 use std::os::fd::AsRawFd;
 use nix::sys::statvfs::statvfs;
+use serde::{Serialize, Deserialize};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -34,19 +35,60 @@ enum Commands {
     },
 }
 
-// Represents a range in the target file that's different from the base file (as indicated by the CoW metadata)
-#[derive(Debug)]
+/// Represents a range in the target file that's different from the base file (as indicated by the CoW metadata)
+#[derive(Debug, Serialize, Deserialize)]
 struct DiffRange {
     logical_offset: u64,
     length: u64,
 }
 
-// We'll define a simple file format (.bdiff):
-// - 8 bytes: magic string b"BDIFFv1\0"
-// - 8 bytes (u64): number of diff ranges
-// - For each diff range: 16 bytes (two u64s: logical_offset, length)
-// - Padding to align with block boundary
-// - Followed by contiguous block data for each range
+const MAGIC: &[u8; 8] = b"BDIFFv1\0";
+
+/// Represents the header of a bdiff file. The file format is:
+/// - Header:
+///   - 8 bytes: magic string ("BDIFFv1\0")
+///   - 8 bytes: target file size (little-endian)
+///   - 8 bytes: base file size (little-endian)
+///   - 8 bytes: number of ranges (little-endian)
+///   - Ranges array, each range containing:
+///     - 8 bytes: logical offset (little-endian)
+///     - 8 bytes: length (little-endian)
+/// - Padding to next block boundary
+/// - Range data (contiguous blocks of data)
+#[derive(Debug, Serialize, Deserialize)]
+struct BDiffHeader {
+    magic: [u8; 8],
+    target_size: u64,
+    base_size: u64,
+    ranges: Vec<DiffRange>,
+}
+
+impl BDiffHeader {
+    fn new(target_size: u64, base_size: u64, ranges: Vec<DiffRange>) -> Self {
+        Self {
+            magic: *MAGIC,
+            target_size,
+            base_size,
+            ranges,
+        }
+    }
+
+    fn write_to(&self, writer: impl Write) -> Result<(), Error> {
+        bincode::serialize_into(writer, self)
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    fn read_from(reader: impl Read) -> Result<Self, Error> {
+        let header: Self = bincode::deserialize_from(reader)
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        
+        if header.magic != *MAGIC {
+            return Err(Error::new(std::io::ErrorKind::InvalidData, "Invalid bdiff file format"));
+        }
+        
+        Ok(header)
+    }
+}
 
 fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
@@ -182,38 +224,33 @@ fn get_fs_block_size(path: &str) -> Result<usize, Error> {
 fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result<(), Error> {
     // 1) Open the target file so we can copy bytes from it later
     let target = File::open(target_file)?;
+    let base = File::open(base_file)?;
+    let target_size = target.metadata()?.len();
+    let base_size = base.metadata()?.len();
 
-    // 2) Compute the diff ranges.
+    // 2) Compute the diff ranges
     let diff_ranges = get_different_ranges(target_file, base_file)?;
-
     let total_size: u64 = diff_ranges.iter().map(|range| range.length).sum();
     println!("Size of blockdiff: {}", format_size(total_size));
 
     // 3) Create the bdiff file
     let mut diff_out = File::create(bdiff_output)?;
 
-    // 4) Write the header with block alignment
-    let magic = b"BDIFFv1\0"; // 8 bytes
-    diff_out.write_all(magic)?;
-    let num_ranges = diff_ranges.len() as u64;
-    diff_out.write_all(&num_ranges.to_le_bytes())?;
+    // 4) Create and write the header
+    let header = BDiffHeader::new(target_size, base_size, diff_ranges);
+    header.write_to(&mut diff_out)?;
 
-    // Write all range headers
-    for range in &diff_ranges {
-        diff_out.write_all(&range.logical_offset.to_le_bytes())?;
-        diff_out.write_all(&range.length.to_le_bytes())?;
-    }
-
-    // Pad with zeros to align header to block boundary
+    // 5) Pad with zeros to align header to block boundary
     // (This makes sure XFS can use reflink copies for the data blocks)
     let block_size = get_fs_block_size(target_file)?;
-    let header_size = 8 + 8 + (diff_ranges.len() * 16); // magic + num_ranges + (offset + length) for each range
+    let header_size = bincode::serialized_size(&header)     
+        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))? as usize;
     let padding_size = (block_size - (header_size % block_size)) % block_size;
     let padding = vec![0u8; padding_size];
     diff_out.write_all(&padding)?;
 
-    // 6) Write all data blocks contiguously after the header.
-    for range in &diff_ranges {
+    // 6) Write all data blocks contiguously after the header
+    for range in &header.ranges {
         let mut off_in = range.logical_offset as i64;
 
         let copied = copy_file_range(
@@ -226,7 +263,11 @@ fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
 
         if copied != range.length as usize {
-            return Err(Error::new(std::io::ErrorKind::UnexpectedEof, format!("Failed to copy all requested bytes for range {:?}: copied {} bytes, expected {}", range, copied, range.length)));
+            return Err(Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("Failed to copy all requested bytes for range {:?}: copied {} bytes, expected {}", 
+                    range, copied, range.length)
+            ));
         }
     }
 
@@ -263,44 +304,22 @@ fn apply_diff(target_file: &str, base_file: &str, bdiff_input: &str) -> Result<(
 
     println!("Created target file at {}", target_file);
     
-    // Open the diff file
+    // Open the diff file and read header
     let mut diff_in = File::open(bdiff_input)?;
-    let target = File::options().write(true).open(target_file)?;
-    
-    // Read and verify magic
-    let mut magic = [0u8; 8];
-    diff_in.read_exact(&mut magic)?;
-    if magic != *b"BDIFFv1\0" {
-        return Err(Error::new(std::io::ErrorKind::InvalidData, "Invalid bdiff file format"));
-    }
-    
-    // Read number of ranges
-    let mut num_ranges = [0u8; 8];
-    diff_in.read_exact(&mut num_ranges)?;
-    let num_ranges = u64::from_le_bytes(num_ranges);
-    
-    // Read all range headers
-    let mut ranges = Vec::with_capacity(num_ranges as usize);
-    for _ in 0..num_ranges {
-        let mut offset = [0u8; 8];
-        let mut length = [0u8; 8];
-        diff_in.read_exact(&mut offset)?;
-        diff_in.read_exact(&mut length)?;
-        ranges.push(DiffRange {
-            logical_offset: u64::from_le_bytes(offset),
-            length: u64::from_le_bytes(length)
-            ,
-        });
-    }
+    let header = BDiffHeader::read_from(&mut diff_in)?;
     
     // Skip padding to align with block boundary
     let block_size = get_fs_block_size(bdiff_input)?;
-    let header_size = 8 + 8 + (num_ranges as usize * 16); // magic + num_ranges + (offset + length) for each range
+    let header_size = bincode::serialized_size(&header)
+        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))? as usize;
     let padding_size = (block_size - (header_size % block_size)) % block_size;
     diff_in.seek(std::io::SeekFrom::Current(padding_size as i64))?;
     
+    // Open target file for writing
+    let target = File::options().write(true).open(target_file)?;
+    
     // Apply each range
-    for range in ranges {
+    for range in header.ranges {
         let mut off_out = range.logical_offset as i64;
         let copied = copy_file_range(
             diff_in.as_raw_fd(),
@@ -311,12 +330,16 @@ fn apply_diff(target_file: &str, base_file: &str, bdiff_input: &str) -> Result<(
         ).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
         
         if copied != range.length as usize {
-            return Err(Error::new(std::io::ErrorKind::UnexpectedEof, format!("Failed to copy all requested bytes for range {:?}: copied {} bytes, expected {}", range, copied, range.length)));
+            return Err(Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("Failed to copy all requested bytes for range {:?}: copied {} bytes, expected {}", 
+                    range, copied, range.length)
+            ));
         }
     }
 
     println!("Successfully applied {} to target file", bdiff_input);
-    
+
     Ok(())
 }
 
