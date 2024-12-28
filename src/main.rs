@@ -3,7 +3,6 @@ use std::io::{Error, Write, Read, Seek};
 use std::fs::File;
 use nix::fcntl::copy_file_range;
 use std::os::fd::AsRawFd;
-use nix::sys::statvfs::statvfs;
 use serde::{Serialize, Deserialize};
 
 #[derive(Parser)]
@@ -42,7 +41,11 @@ struct DiffRange {
     length: u64,
 }
 
+/// Magic string for bdiff files ("BDIFFv1\0")
 const MAGIC: &[u8; 8] = b"BDIFFv1\0";
+
+/// Standard block size used for alignment (4 KiB)
+const BLOCK_SIZE: usize = 4096;
 
 /// Represents the header of a bdiff file. The file format is:
 /// - Header:
@@ -53,7 +56,7 @@ const MAGIC: &[u8; 8] = b"BDIFFv1\0";
 ///   - Ranges array, each range containing:
 ///     - 8 bytes: logical offset (little-endian)
 ///     - 8 bytes: length (little-endian)
-/// - Padding to next block boundary
+/// - Padding to next block boundary (4 KiB)
 /// - Range data (contiguous blocks of data)
 #[derive(Debug, Serialize, Deserialize)]
 struct BDiffHeader {
@@ -215,11 +218,6 @@ fn get_different_ranges(target_file: &str, base_file: &str) -> Result<Vec<DiffRa
     Ok(diff_ranges)
 }
 
-fn get_fs_block_size(path: &str) -> Result<usize, Error> {
-    let fs_stat = statvfs(path)
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    Ok(fs_stat.block_size() as usize)
-}
 
 fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result<(), Error> {
     // 1) Open the target file so we can copy bytes from it later
@@ -241,11 +239,9 @@ fn create_diff(target_file: &str, base_file: &str, bdiff_output: &str) -> Result
     header.write_to(&mut diff_out)?;
 
     // 5) Pad with zeros to align header to block boundary
-    // (This makes sure XFS can use reflink copies for the data blocks)
-    let block_size = get_fs_block_size(target_file)?;
     let header_size = bincode::serialized_size(&header)     
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))? as usize;
-    let padding_size = (block_size - (header_size % block_size)) % block_size;
+    let padding_size = (BLOCK_SIZE - (header_size % BLOCK_SIZE)) % BLOCK_SIZE;
     let padding = vec![0u8; padding_size];
     diff_out.write_all(&padding)?;
 
@@ -309,10 +305,9 @@ fn apply_diff(target_file: &str, base_file: &str, bdiff_input: &str) -> Result<(
     let header = BDiffHeader::read_from(&mut diff_in)?;
     
     // Skip padding to align with block boundary
-    let block_size = get_fs_block_size(bdiff_input)?;
     let header_size = bincode::serialized_size(&header)
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))? as usize;
-    let padding_size = (block_size - (header_size % block_size)) % block_size;
+    let padding_size = (BLOCK_SIZE - (header_size % BLOCK_SIZE)) % BLOCK_SIZE;
     diff_in.seek(std::io::SeekFrom::Current(padding_size as i64))?;
     
     // Open target file for writing
