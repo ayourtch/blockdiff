@@ -194,6 +194,21 @@ fn get_different_ranges(target_file: &str, base_file: Option<&str>) -> Result<Ve
             let base_start = base_extent.fe_logical;
             let base_end = extent_end(base_extent);
 
+            // If base_start > current_start, there's a gap in base coverage. Mark the gap as different.
+            if base_start > current_start {
+                let gap_len = (base_start - current_start).min(current_remaining);
+                diff_ranges.push(DiffRange {
+                    logical_offset: current_start,
+                    length: gap_len,
+                });
+                current_start += gap_len;
+                current_remaining -= gap_len;
+                if current_remaining == 0 { 
+                    // done with this target extent
+                    continue 'target_loop; 
+                }
+            }
+
             // Compute overlap boundaries
             let overlap_start = current_start.max(base_start);
             let overlap_end = (current_start + current_remaining).min(base_end);
