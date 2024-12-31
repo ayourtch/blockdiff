@@ -34,6 +34,13 @@ enum Commands {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Debug: display header information from a bdiff file
+    Debug {
+        /// Path to the bdiff file to inspect
+        bdiff_input: String,
+        /// Optional hex offset to filter ranges around (±1MB)
+        offset: Option<String>,
+    },
 }
 
 /// Represents a range in the target file that's different from the base file (as indicated by the CoW metadata)
@@ -413,6 +420,121 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
     Ok(())
 }
 
+fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error> {
+    // Parse the hex offset if provided
+    let filter_offset = if let Some(off_str) = offset_str {
+        // Remove "0x" prefix if present and parse
+        let cleaned = off_str.trim_start_matches("0x");
+        Some(u64::from_str_radix(cleaned, 16).map_err(|e| Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid hex offset: {}", e)
+        ))?)
+    } else {
+        None
+    };
+
+    if input_file.ends_with(".bdiff") {
+        let diff_in = File::open(input_file)?;
+        let header = BDiffHeader::read_from(diff_in)?;
+
+        println!("BDiff File: {}", input_file);
+        println!("Magic: {:?}", String::from_utf8_lossy(&header.magic));
+        println!("Target file size: {}", format_size(header.target_size));
+        println!("Base file size: {}", format_size(header.base_size));
+        println!("Number of ranges: {}", header.ranges.len());
+        
+        let total_diff_size: u64 = header.ranges.iter().map(|r| r.length).sum();
+        println!("Total diff size: {}", format_size(total_diff_size));
+        
+        println!("\nRanges:");
+        if let Some(offset) = filter_offset {
+            // Find the range containing the offset
+            let containing_idx = header.ranges.iter()
+                .position(|r| r.logical_offset <= offset && offset < r.logical_offset + r.length);
+            
+            if let Some(idx) = containing_idx {
+                // Show 3 ranges before and after
+                let start_idx = idx.saturating_sub(3);
+                let end_idx = (idx + 4).min(header.ranges.len());
+                
+                for i in start_idx..end_idx {
+                    let range = &header.ranges[i];
+                    println!("  {}{}: offset={:#x} length={:#x} ({})", 
+                        if i == idx { ">" } else { " " },
+                        i,
+                        range.logical_offset,
+                        range.length,
+                        format_size(range.length)
+                    );
+                }
+            } else {
+                println!("  No range contains offset {:#x}", offset);
+            }
+        } else {
+            // Show all ranges when no filter
+            for (i, range) in header.ranges.iter().enumerate() {
+                println!("  {}: offset={:#x} length={:#x} ({})", 
+                    i,
+                    range.logical_offset,
+                    range.length,
+                    format_size(range.length)
+                );
+            }
+        }
+    } else {
+        println!("File: {}", input_file);
+        
+        let mut extents: Vec<_> = fiemap::fiemap(input_file)?.collect::<Result<Vec<_>, _>>()?;
+        extents.sort_by_key(|e| e.fe_logical);
+        
+        let total_size: u64 = extents.iter().map(|e| e.fe_length).sum();
+        println!("Total file size: {}", format_size(total_size));
+        println!("Number of extents: {}", extents.len());
+        
+        println!("\nExtents:");
+        if let Some(offset) = filter_offset {
+            // Find the extent containing the offset
+            let containing_idx = extents.iter()
+                .position(|e| e.fe_logical <= offset && offset < e.fe_logical + e.fe_length);
+            
+            if let Some(idx) = containing_idx {
+                // Show 3 extents before and after
+                let start_idx = idx.saturating_sub(3);
+                let end_idx = (idx + 4).min(extents.len());
+                
+                for i in start_idx..end_idx {
+                    let extent = &extents[i];
+                    println!("  {}{}: logical={:#x} physical={:#x} length={:#x} ({}) flags={:?}", 
+                        if i == idx { ">" } else { " " },
+                        i,
+                        extent.fe_logical,
+                        extent.fe_physical,
+                        extent.fe_length,
+                        format_size(extent.fe_length),
+                        extent.fe_flags
+                    );
+                }
+            } else {
+                println!("  No extent contains offset {:#x}", offset);
+            }
+        } else {
+            // Show all extents when no filter
+            for (i, extent) in extents.iter().enumerate() {
+                println!("  {}: logical={:#x} physical={:#x} length={:#x} ({}) flags={:?}", 
+                    i,
+                    extent.fe_logical,
+                    extent.fe_physical,
+                    extent.fe_length,
+                    format_size(extent.fe_length),
+                    extent.fe_flags
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Error> {
     let cli = Cli::parse();
 
@@ -422,6 +544,9 @@ fn main() -> Result<(), Error> {
         }
         Commands::Apply { bdiff_input, target_file, base } => {
             apply_diff(bdiff_input, target_file, base.as_deref())
+        }
+        Commands::Debug { bdiff_input, offset } => {
+            debug_viewer(bdiff_input, offset.as_deref())
         }
     }
 }
