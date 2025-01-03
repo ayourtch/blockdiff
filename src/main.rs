@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
-use std::io::{Error, Write, Read, Seek};
-use std::fs::File;
 use nix::fcntl::copy_file_range;
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{Error, Read, Seek, Write};
 use std::os::fd::AsRawFd;
-use serde::{Serialize, Deserialize};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -34,8 +34,8 @@ enum Commands {
         #[arg(long)]
         base: Option<String>,
     },
-    /// Debug: display header information from a bdiff file
-    Debug {
+    /// View header information & extent map from a bdiff file
+    View {
         /// Path to the bdiff file to inspect
         bdiff_input: String,
         /// Optional hex offset to filter ranges around (±1MB)
@@ -86,8 +86,7 @@ impl BDiffHeader {
     }
 
     fn write_to(&self, writer: impl Write) -> Result<(), Error> {
-        bincode::serialize_into(writer, self)
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+        bincode::serialize_into(writer, self).map_err(|e| Error::new(std::io::ErrorKind::Other, e))
     }
 
     fn read_from(reader: impl Read) -> Result<Self, Error> {
@@ -95,7 +94,10 @@ impl BDiffHeader {
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         
         if header.magic != *MAGIC {
-            return Err(Error::new(std::io::ErrorKind::InvalidData, "Invalid bdiff file format"));
+            return Err(Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid bdiff file format",
+            ));
         }
         
         Ok(header)
@@ -125,7 +127,10 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn get_different_ranges(target_file: &str, base_file: Option<&str>) -> Result<Vec<DiffRange>, Error> {
+fn get_different_ranges(
+    target_file: &str,
+    base_file: Option<&str>,
+) -> Result<Vec<DiffRange>, Error> {
     let mut diff_ranges = Vec::new();
     
     // Get fiemap for target file
@@ -144,7 +149,8 @@ fn get_different_ranges(target_file: &str, base_file: Option<&str>) -> Result<Ve
     }
 
     // Get fiemap for base file
-    let mut base_extents: Vec<_> = fiemap::fiemap(base_file.unwrap())?.collect::<Result<Vec<_>, _>>()?;
+    let mut base_extents: Vec<_> =
+        fiemap::fiemap(base_file.unwrap())?.collect::<Result<Vec<_>, _>>()?;
     base_extents.sort_by_key(|e| e.fe_logical);
 
     // Total size of target file
@@ -166,7 +172,10 @@ fn get_different_ranges(target_file: &str, base_file: Option<&str>) -> Result<Ve
         let mut current_remaining = target_extent.fe_length;
 
         // If this is a non-shared extent, it's entirely different.
-        if !target_extent.fe_flags.contains(fiemap::FiemapExtentFlags::SHARED) {
+        if !target_extent
+            .fe_flags
+            .contains(fiemap::FiemapExtentFlags::SHARED)
+        {
             diff_ranges.push(DiffRange {
                 logical_offset: current_start,
                 length: current_remaining,
@@ -259,54 +268,60 @@ fn get_different_ranges(target_file: &str, base_file: Option<&str>) -> Result<Ve
 /// Returns the total number of bytes copied.
 fn copy_range(
     src_fd: std::os::unix::io::RawFd,
-    src_offset: Option<&mut i64>,
+    mut src_offset: Option<&mut i64>,
     dst_fd: std::os::unix::io::RawFd,
-    dst_offset: Option<&mut i64>,
+    mut dst_offset: Option<&mut i64>,
     length: usize,
 ) -> Result<usize, Error> {
     let mut copied_total = 0;
-    
-    // Create local mutable copies of the offsets if they exist
-    let mut local_src_offset = src_offset.as_ref().map(|o| **o);
-    let mut local_dst_offset = dst_offset.as_ref().map(|o| **o);
 
     while copied_total < length {
         let copied = copy_file_range(
             src_fd,
-            local_src_offset.as_mut(),
+            src_offset.as_deref_mut(),
             dst_fd,
-            local_dst_offset.as_mut(),
-            length - copied_total
-        ).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+            dst_offset.as_deref_mut(),
+            length - copied_total,
+        )
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
         
         if copied == 0 {
             return Err(Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("Unexpected EOF: copied {} bytes, expected {}", copied_total, length)
+                format!(
+                    "Unexpected EOF: copied {} bytes, expected {}",
+                    copied_total, length
+                ),
             ));
         }
         
         copied_total += copied;
     }
 
-    // Update the original offsets with the final values
-    if let Some(src_off) = src_offset {
-        *src_off = local_src_offset.unwrap_or(*src_off);
-    }
-    if let Some(dst_off) = dst_offset {
-        *dst_off = local_dst_offset.unwrap_or(*dst_off);
-    }
-
     Ok(copied_total)
 }
 
-fn create_diff(bdiff_output: &str, target_file: &str, base_file: Option<&str>) -> Result<(), Error> {
+fn create_diff(
+    bdiff_output: &str,
+    target_file: &str,
+    base_file: Option<&str>,
+) -> Result<(), Error> {
     // 1) Open the target file so we can copy bytes from it later
     let target = File::open(target_file)?;
     let base = if let Some(base) = base_file {
-        File::open(base)?
+        File::open(base).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("Failed to open base file '{}': {}", base, e),
+            )
+        })?
     } else {
-        File::open(target_file)?
+        File::open(target_file).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("Failed to open target file '{}': {}", target_file, e),
+            )
+        })?
     };
     let target_size = target.metadata()?.len();
     let base_size = base.metadata()?.len();
@@ -317,7 +332,12 @@ fn create_diff(bdiff_output: &str, target_file: &str, base_file: Option<&str>) -
     println!("Size of blockdiff: {}", format_size(total_size));
 
     // 3) Create the bdiff file
-    let mut diff_out = File::create(bdiff_output)?;
+    let mut diff_out = File::create(bdiff_output).map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!("Failed to create bdiff file '{}': {}", bdiff_output, e),
+        )
+    })?;
 
     // 4) Create and write the header
     let header = BDiffHeader::new(target_size, base_size, diff_ranges);
@@ -358,26 +378,36 @@ fn create_diff(bdiff_output: &str, target_file: &str, base_file: Option<&str>) -
 
 fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> Result<(), Error> {
     // Open the diff file and read header
-    let mut diff_in = File::open(bdiff_input)?;
+    let mut diff_in = File::open(bdiff_input).map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!("Failed to open bdiff file '{}': {}", bdiff_input, e),
+        )
+    })?;
     let header = BDiffHeader::read_from(&mut diff_in)?;
 
     // Create target file (either as reflink copy of base or empty sparse file)
     let target = File::options()
         .write(true)
         .create(true)
-        .open(target_file)?;
+        .open(target_file)
+        .map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("Failed to create target file '{}': {}", target_file, e),
+            )
+        })?;
 
     if let Some(base) = base_file {
         // Create as reflink copy of base
-        let src = File::open(base)?;
+        let src = File::open(base).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("Failed to open base file '{}': {}", base, e),
+            )
+        })?;
         let total_len = src.metadata()?.len() as usize;
-        let copied = copy_range(
-            src.as_raw_fd(),
-            None,
-            target.as_raw_fd(),
-            None,
-            total_len
-        )?;
+        let copied = copy_range(src.as_raw_fd(), None, target.as_raw_fd(), None, total_len)?;
         
         if copied != total_len {
             return Err(Error::new(
@@ -387,7 +417,10 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
             ));
         }
 
-        println!("Initialized target file as reflink copy of base file at: {}", target_file);
+        println!(
+            "Initialized target file as reflink copy of base file at: {}",
+            target_file
+        );
 
         // Check if target size differs from base size and resize if needed
         if header.target_size != header.base_size {
@@ -401,7 +434,11 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
     } else {
         // Create empty sparse file of target size
         target.set_len(header.target_size)?;
-        println!("Initialized target file as empty sparse file of size {} at: {}", format_size(header.target_size), target_file);
+        println!(
+            "Initialized target file as empty sparse file of size {} at: {}",
+            format_size(header.target_size),
+            target_file
+        );
     }
 
     // Skip padding to align with block boundary
@@ -440,16 +477,23 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
     let filter_offset = if let Some(off_str) = offset_str {
         // Remove "0x" prefix if present and parse
         let cleaned = off_str.trim_start_matches("0x");
-        Some(u64::from_str_radix(cleaned, 16).map_err(|e| Error::new(
+        Some(u64::from_str_radix(cleaned, 16).map_err(|e| {
+            Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("Invalid hex offset: {}", e)
-        ))?)
+                format!("Invalid hex offset: {}", e),
+            )
+        })?)
     } else {
         None
     };
 
     if input_file.ends_with(".bdiff") {
-        let diff_in = File::open(input_file)?;
+        let diff_in = File::open(input_file).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("Failed to open bdiff file '{}': {}", input_file, e),
+            )
+        })?;
         let header = BDiffHeader::read_from(diff_in)?;
 
         println!("BDiff File: {}", input_file);
@@ -464,7 +508,9 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
         println!("\nRanges:");
         if let Some(offset) = filter_offset {
             // Find the range containing the offset
-            let containing_idx = header.ranges.iter()
+            let containing_idx = header
+                .ranges
+                .iter()
                 .position(|r| r.logical_offset <= offset && offset < r.logical_offset + r.length);
             
             if let Some(idx) = containing_idx {
@@ -474,7 +520,8 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
                 
                 for i in start_idx..end_idx {
                     let range = &header.ranges[i];
-                    println!("  {}{}: offset={:#x} length={:#x} ({})", 
+                    println!(
+                        "  {}{}: offset={:#x} length={:#x} ({})",
                         if i == idx { ">" } else { " " },
                         i,
                         range.logical_offset,
@@ -488,7 +535,8 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
         } else {
             // Show all ranges when no filter
             for (i, range) in header.ranges.iter().enumerate() {
-                println!("  {}: offset={:#x} length={:#x} ({})", 
+                println!(
+                    "  {}: offset={:#x} length={:#x} ({})",
                     i,
                     range.logical_offset,
                     range.length,
@@ -509,7 +557,8 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
         println!("\nExtents:");
         if let Some(offset) = filter_offset {
             // Find the extent containing the offset
-            let containing_idx = extents.iter()
+            let containing_idx = extents
+                .iter()
                 .position(|e| e.fe_logical <= offset && offset < e.fe_logical + e.fe_length);
             
             if let Some(idx) = containing_idx {
@@ -519,7 +568,8 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
                 
                 for i in start_idx..end_idx {
                     let extent = &extents[i];
-                    println!("  {}{}: logical={:#x} physical={:#x} length={:#x} ({}) flags={:?}", 
+                    println!(
+                        "  {}{}: logical={:#x} physical={:#x} length={:#x} ({}) flags={:?}",
                         if i == idx { ">" } else { " " },
                         i,
                         extent.fe_logical,
@@ -535,7 +585,8 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
         } else {
             // Show all extents when no filter
             for (i, extent) in extents.iter().enumerate() {
-                println!("  {}: logical={:#x} physical={:#x} length={:#x} ({}) flags={:?}", 
+                println!(
+                    "  {}: logical={:#x} physical={:#x} length={:#x} ({}) flags={:?}",
                     i,
                     extent.fe_logical,
                     extent.fe_physical,
@@ -554,14 +605,19 @@ fn main() -> Result<(), Error> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Create { bdiff_output, target_file, base } => {
-            create_diff(bdiff_output, target_file, base.as_deref())
-        }
-        Commands::Apply { bdiff_input, target_file, base } => {
-            apply_diff(bdiff_input, target_file, base.as_deref())
-        }
-        Commands::Debug { bdiff_input, offset } => {
-            debug_viewer(bdiff_input, offset.as_deref())
+        Commands::Create {
+            bdiff_output,
+            target_file,
+            base,
+        } => create_diff(bdiff_output, target_file, base.as_deref()),
+        Commands::Apply {
+            bdiff_input,
+            target_file,
+            base,
+        } => apply_diff(bdiff_input, target_file, base.as_deref()),
+        Commands::View {
+            bdiff_input,
+            offset,
+        } => debug_viewer(bdiff_input, offset.as_deref()),
         }
     }
-}
