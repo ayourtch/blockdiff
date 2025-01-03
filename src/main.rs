@@ -92,21 +92,21 @@ impl BDiffHeader {
     fn read_from(reader: impl Read) -> Result<Self, Error> {
         let header: Self = bincode::deserialize_from(reader)
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        
+
         if header.magic != *MAGIC {
             return Err(Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Invalid bdiff file format",
             ));
         }
-        
+
         Ok(header)
     }
 }
 
 fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    
+
     if bytes == 0 {
         return "0 B".to_string();
     }
@@ -118,7 +118,7 @@ fn format_size(bytes: u64) -> String {
 
     // Convert to the chosen unit
     let bytes = bytes as f64 / (1024_u64.pow(exp as u32) as f64);
-    
+
     // Format with 1 decimal place if >= 1024 bytes, otherwise no decimal
     if exp == 0 {
         format!("{} {}", bytes.round(), UNITS[exp])
@@ -132,10 +132,56 @@ fn get_different_ranges(
     base_file: Option<&str>,
 ) -> Result<Vec<DiffRange>, Error> {
     let mut diff_ranges = Vec::new();
-    
+
     // Get fiemap for target file
     let mut target_extents: Vec<_> = fiemap::fiemap(target_file)?.collect::<Result<Vec<_>, _>>()?;
     target_extents.sort_by_key(|e| e.fe_logical);
+
+    // Check for any unsafe/unsupported flags
+    for extent in &target_extents {
+        use fiemap::FiemapExtentFlags as Flags;
+
+        let unsafe_flags = [
+            // Flags that indicate the file needs syncing
+            (
+                Flags::DELALLOC,
+                "File has pending delayed allocations. Please sync file and try again",
+            ),
+            (
+                Flags::UNWRITTEN,
+                "File has unwritten extents. Please sync file and try again",
+            ),
+            (
+                Flags::NOT_ALIGNED,
+                "File has unaligned extents. Please sync file and try again",
+            ),
+            // Flags that indicate unsupported features
+            (
+                Flags::UNKNOWN,
+                "Data location is unknown which is not supported",
+            ),
+            (
+                Flags::ENCODED,
+                "File contains encoded data which is not supported",
+            ),
+            (
+                Flags::DATA_ENCRYPTED,
+                "File contains encrypted data which is not supported",
+            ),
+        ];
+
+        for (flag, message) in unsafe_flags {
+            if extent.fe_flags.contains(flag) {
+                return Err(Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Unsafe file state: extent at offset {:#x} has {:?} flag. {}.",
+                        extent.fe_logical, flag, message
+                    ),
+                ));
+            }
+        }
+    }
 
     // If no base file, return all non-empty extents
     if base_file.is_none() {
@@ -212,9 +258,9 @@ fn get_different_ranges(
                 });
                 current_start += gap_len;
                 current_remaining -= gap_len;
-                if current_remaining == 0 { 
+                if current_remaining == 0 {
                     // done with this target extent
-                    continue 'target_loop; 
+                    continue 'target_loop;
                 }
             }
 
@@ -284,7 +330,7 @@ fn copy_range(
             length - copied_total,
         )
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-        
+
         if copied == 0 {
             return Err(Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -294,7 +340,7 @@ fn copy_range(
                 ),
             ));
         }
-        
+
         copied_total += copied;
     }
 
@@ -307,7 +353,16 @@ fn create_diff(
     base_file: Option<&str>,
 ) -> Result<(), Error> {
     // 1) Open the target file so we can copy bytes from it later
-    let target = File::open(target_file)?;
+    let target = File::open(target_file).map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!("Failed to open target file '{}': {}", target_file, e),
+        )
+    })?;
+
+    // Sync the target file to ensure all delayed allocations are resolved
+    nix::unistd::fsync(target.as_raw_fd()).map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+
     let base = if let Some(base) = base_file {
         File::open(base).map_err(|e| {
             Error::new(
@@ -344,7 +399,7 @@ fn create_diff(
     header.write_to(&mut diff_out)?;
 
     // 5) Pad with zeros to align header to block boundary
-    let header_size = bincode::serialized_size(&header)     
+    let header_size = bincode::serialized_size(&header)
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))? as usize;
     let padding_size = (BLOCK_SIZE - (header_size % BLOCK_SIZE)) % BLOCK_SIZE;
     let padding = vec![0u8; padding_size];
@@ -408,7 +463,7 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
         })?;
         let total_len = src.metadata()?.len() as usize;
         let copied = copy_range(src.as_raw_fd(), None, target.as_raw_fd(), None, total_len)?;
-        
+
         if copied != total_len {
             return Err(Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -446,7 +501,7 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))? as usize;
     let padding_size = (BLOCK_SIZE - (header_size % BLOCK_SIZE)) % BLOCK_SIZE;
     diff_in.seek(std::io::SeekFrom::Current(padding_size as i64))?;
-    
+
     // Apply each range
     for range in header.ranges {
         let mut off_out = range.logical_offset as i64;
@@ -457,7 +512,7 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
             Some(&mut off_out),
             range.length as usize,
         )?;
-        
+
         if copied != range.length as usize {
             return Err(Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -479,7 +534,7 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
         let cleaned = off_str.trim_start_matches("0x");
         Some(u64::from_str_radix(cleaned, 16).map_err(|e| {
             Error::new(
-            std::io::ErrorKind::InvalidInput,
+                std::io::ErrorKind::InvalidInput,
                 format!("Invalid hex offset: {}", e),
             )
         })?)
@@ -501,10 +556,10 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
         println!("Target file size: {}", format_size(header.target_size));
         println!("Base file size: {}", format_size(header.base_size));
         println!("Number of ranges: {}", header.ranges.len());
-        
+
         let total_diff_size: u64 = header.ranges.iter().map(|r| r.length).sum();
         println!("Total diff size: {}", format_size(total_diff_size));
-        
+
         println!("\nRanges:");
         if let Some(offset) = filter_offset {
             // Find the range containing the offset
@@ -512,12 +567,12 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
                 .ranges
                 .iter()
                 .position(|r| r.logical_offset <= offset && offset < r.logical_offset + r.length);
-            
+
             if let Some(idx) = containing_idx {
                 // Show 3 ranges before and after
                 let start_idx = idx.saturating_sub(3);
                 let end_idx = (idx + 4).min(header.ranges.len());
-                
+
                 for i in start_idx..end_idx {
                     let range = &header.ranges[i];
                     println!(
@@ -546,26 +601,26 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
         }
     } else {
         println!("File: {}", input_file);
-        
+
         let mut extents: Vec<_> = fiemap::fiemap(input_file)?.collect::<Result<Vec<_>, _>>()?;
         extents.sort_by_key(|e| e.fe_logical);
-        
+
         let total_size: u64 = extents.iter().map(|e| e.fe_length).sum();
         println!("Total file size: {}", format_size(total_size));
         println!("Number of extents: {}", extents.len());
-        
+
         println!("\nExtents:");
         if let Some(offset) = filter_offset {
             // Find the extent containing the offset
             let containing_idx = extents
                 .iter()
                 .position(|e| e.fe_logical <= offset && offset < e.fe_logical + e.fe_length);
-            
+
             if let Some(idx) = containing_idx {
                 // Show 3 extents before and after
                 let start_idx = idx.saturating_sub(3);
                 let end_idx = (idx + 4).min(extents.len());
-                
+
                 for i in start_idx..end_idx {
                     let extent = &extents[i];
                     println!(
@@ -619,5 +674,5 @@ fn main() -> Result<(), Error> {
             bdiff_input,
             offset,
         } => debug_viewer(bdiff_input, offset.as_deref()),
-        }
     }
+}
