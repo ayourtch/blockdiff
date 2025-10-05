@@ -1,9 +1,15 @@
 use clap::{Parser, Subcommand};
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::fcntl::copy_file_range;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Error, Read, Seek, Write};
 use std::os::fd::AsRawFd;
+
+#[cfg(target_os = "macos")]
+mod macos_extents;
+#[cfg(target_os = "macos")]
+use macos_extents::get_file_extents;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -127,58 +133,100 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+// Platform-agnostic extent structure
+#[derive(Debug, Clone)]
+struct FileExtent {
+    fe_logical: u64,
+    fe_physical: u64,
+    fe_length: u64,
+    is_shared: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn get_extents(path: &str) -> Result<Vec<FileExtent>, Error> {
+    let extents: Vec<_> = fiemap::fiemap(path)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|e| FileExtent {
+            fe_logical: e.fe_logical,
+            fe_physical: e.fe_physical,
+            fe_length: e.fe_length,
+            is_shared: e.fe_flags.contains(fiemap::FiemapExtentFlags::SHARED),
+        })
+        .collect();
+    Ok(extents)
+}
+
+#[cfg(target_os = "macos")]
+fn get_extents(path: &str) -> Result<Vec<FileExtent>, Error> {
+    let extents = get_file_extents(path)?
+        .into_iter()
+        .map(|e| FileExtent {
+            fe_logical: e.fe_logical,
+            fe_physical: e.fe_physical,
+            fe_length: e.fe_length,
+            is_shared: e.fe_flags.contains(macos_extents::ExtentFlags::SHARED),
+        })
+        .collect();
+    Ok(extents)
+}
+
 fn get_different_ranges(
     target_file: &str,
     base_file: Option<&str>,
 ) -> Result<Vec<DiffRange>, Error> {
     let mut diff_ranges = Vec::new();
 
-    // Get fiemap for target file
-    let mut target_extents: Vec<_> = fiemap::fiemap(target_file)?.collect::<Result<Vec<_>, _>>()?;
+    // Get extents for target file
+    let mut target_extents = get_extents(target_file)?;
     target_extents.sort_by_key(|e| e.fe_logical);
 
-    // Check for any unsafe/unsupported flags
-    for extent in &target_extents {
-        use fiemap::FiemapExtentFlags as Flags;
+    // Check for any unsafe/unsupported flags (Linux only)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let raw_extents: Vec<_> = fiemap::fiemap(target_file)?.collect::<Result<Vec<_>, _>>()?;
+        for extent in &raw_extents {
+            use fiemap::FiemapExtentFlags as Flags;
 
-        let unsafe_flags = [
-            // Flags that indicate the file needs syncing
-            (
-                Flags::DELALLOC,
-                "File has pending delayed allocations. Please sync file and try again",
-            ),
-            (
-                Flags::UNWRITTEN,
-                "File has unwritten extents. Please sync file and try again",
-            ),
-            (
-                Flags::NOT_ALIGNED,
-                "File has unaligned extents. Please sync file and try again",
-            ),
-            // Flags that indicate unsupported features
-            (
-                Flags::UNKNOWN,
-                "Data location is unknown which is not supported",
-            ),
-            (
-                Flags::ENCODED,
-                "File contains encoded data which is not supported",
-            ),
-            (
-                Flags::DATA_ENCRYPTED,
-                "File contains encrypted data which is not supported",
-            ),
-        ];
+            let unsafe_flags = [
+                // Flags that indicate the file needs syncing
+                (
+                    Flags::DELALLOC,
+                    "File has pending delayed allocations. Please sync file and try again",
+                ),
+                (
+                    Flags::UNWRITTEN,
+                    "File has unwritten extents. Please sync file and try again",
+                ),
+                (
+                    Flags::NOT_ALIGNED,
+                    "File has unaligned extents. Please sync file and try again",
+                ),
+                // Flags that indicate unsupported features
+                (
+                    Flags::UNKNOWN,
+                    "Data location is unknown which is not supported",
+                ),
+                (
+                    Flags::ENCODED,
+                    "File contains encoded data which is not supported",
+                ),
+                (
+                    Flags::DATA_ENCRYPTED,
+                    "File contains encrypted data which is not supported",
+                ),
+            ];
 
-        for (flag, message) in unsafe_flags {
-            if extent.fe_flags.contains(flag) {
-                return Err(Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Unsafe file state: extent at offset {:#x} has {:?} flag. {}.",
-                        extent.fe_logical, flag, message
-                    ),
-                ));
+            for (flag, message) in unsafe_flags {
+                if extent.fe_flags.contains(flag) {
+                    return Err(Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Unsafe file state: extent at offset {:#x} has {:?} flag. {}.",
+                            extent.fe_logical, flag, message
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -194,9 +242,8 @@ fn get_different_ranges(
         return Ok(diff_ranges);
     }
 
-    // Get fiemap for base file
-    let mut base_extents: Vec<_> =
-        fiemap::fiemap(base_file.unwrap())?.collect::<Result<Vec<_>, _>>()?;
+    // Get extents for base file
+    let mut base_extents = get_extents(base_file.unwrap())?;
     base_extents.sort_by_key(|e| e.fe_logical);
 
     // Total size of target file
@@ -208,7 +255,7 @@ fn get_different_ranges(
     println!("Size of base file: {}", format_size(total_size));
 
     // A helper closure for getting the end of any extent quickly
-    let extent_end = |e: &fiemap::FiemapExtent| e.fe_logical + e.fe_length;
+    let extent_end = |e: &FileExtent| e.fe_logical + e.fe_length;
 
     // Index for base_extents
     let mut i = 0;
@@ -217,19 +264,20 @@ fn get_different_ranges(
         let mut current_start = target_extent.fe_logical;
         let mut current_remaining = target_extent.fe_length;
 
-        // If this is a non-shared extent, it's entirely different.
-        if !target_extent
-            .fe_flags
-            .contains(fiemap::FiemapExtentFlags::SHARED)
+        // On Linux: use the SHARED flag to quickly skip non-shared extents
+        // On macOS: SHARED flag is never set, so we always need to compare physical addresses
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            diff_ranges.push(DiffRange {
-                logical_offset: current_start,
-                length: current_remaining,
-            });
-            continue;
+            if !target_extent.is_shared {
+                diff_ranges.push(DiffRange {
+                    logical_offset: current_start,
+                    length: current_remaining,
+                });
+                continue;
+            }
         }
 
-        // Shared extent: we need to check partial overlaps with base_extents
+        // Check for actual sharing by comparing physical addresses with base extents
         while current_remaining > 0 {
             // Skip any base extents that end before our current offset
             while i < base_extents.len() && extent_end(&base_extents[i]) <= current_start {
@@ -312,6 +360,7 @@ fn get_different_ranges(
 
 /// Copies all bytes from src_fd to dst_fd, handling partial copies and interrupts.
 /// Returns the total number of bytes copied.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn copy_range(
     src_fd: std::os::unix::io::RawFd,
     mut src_offset: Option<&mut i64>,
@@ -342,6 +391,150 @@ fn copy_range(
         }
 
         copied_total += copied;
+    }
+
+    Ok(copied_total)
+}
+
+/// macOS-specific CoW file clone using clonefile
+#[cfg(target_os = "macos")]
+fn clone_file(src_path: &str, dst_path: &str) -> Result<(), Error> {
+    use std::ffi::CString;
+
+    let src_cstr = CString::new(src_path)
+        .map_err(|e| Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let dst_cstr = CString::new(dst_path)
+        .map_err(|e| Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let result = unsafe {
+        libc::clonefile(
+            src_cstr.as_ptr(),
+            dst_cstr.as_ptr(),
+            0, // flags
+        )
+    };
+
+    if result != 0 {
+        return Err(Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+/// macOS/BSD implementation using pread/pwrite for data copying
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn copy_range(
+    src_fd: std::os::unix::io::RawFd,
+    mut src_offset: Option<&mut i64>,
+    dst_fd: std::os::unix::io::RawFd,
+    mut dst_offset: Option<&mut i64>,
+    length: usize,
+) -> Result<usize, Error> {
+    const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB chunks
+    let mut buffer = vec![0u8; CHUNK_SIZE.min(length)];
+    let mut copied_total = 0;
+
+    // Determine starting positions
+    let mut current_src_off = src_offset.as_ref().map(|o| **o).unwrap_or(0);
+    let mut current_dst_off = dst_offset.as_ref().map(|o| **o).unwrap_or(0);
+
+    while copied_total < length {
+        let remaining = length - copied_total;
+        let to_read = remaining.min(CHUNK_SIZE);
+        let chunk = &mut buffer[..to_read];
+
+        // Use pread if we have an offset, otherwise regular read
+        let bytes_read = if src_offset.is_some() {
+            unsafe {
+                let result = libc::pread(
+                    src_fd,
+                    chunk.as_mut_ptr() as *mut libc::c_void,
+                    to_read,
+                    current_src_off,
+                );
+                if result < 0 {
+                    return Err(Error::last_os_error());
+                }
+                result as usize
+            }
+        } else {
+            unsafe {
+                let result = libc::read(
+                    src_fd,
+                    chunk.as_mut_ptr() as *mut libc::c_void,
+                    to_read,
+                );
+                if result < 0 {
+                    return Err(Error::last_os_error());
+                }
+                result as usize
+            }
+        };
+
+        if bytes_read == 0 {
+            return Err(Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "Unexpected EOF: copied {} bytes, expected {}",
+                    copied_total, length
+                ),
+            ));
+        }
+
+        let write_chunk = &chunk[..bytes_read];
+        let mut written = 0;
+
+        // Write all the bytes we read
+        while written < bytes_read {
+            let bytes_to_write = bytes_read - written;
+            let write_result = if dst_offset.is_some() {
+                unsafe {
+                    let result = libc::pwrite(
+                        dst_fd,
+                        write_chunk[written..].as_ptr() as *const libc::c_void,
+                        bytes_to_write,
+                        current_dst_off + written as i64,
+                    );
+                    if result < 0 {
+                        return Err(Error::last_os_error());
+                    }
+                    result as usize
+                }
+            } else {
+                unsafe {
+                    let result = libc::write(
+                        dst_fd,
+                        write_chunk[written..].as_ptr() as *const libc::c_void,
+                        bytes_to_write,
+                    );
+                    if result < 0 {
+                        return Err(Error::last_os_error());
+                    }
+                    result as usize
+                }
+            };
+
+            if write_result == 0 {
+                return Err(Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "Failed to write data",
+                ));
+            }
+
+            written += write_result;
+        }
+
+        copied_total += bytes_read;
+        current_src_off += bytes_read as i64;
+        current_dst_off += bytes_read as i64;
+    }
+
+    // Update offsets if provided
+    if let Some(ref mut off) = src_offset {
+        **off = current_src_off;
+    }
+    if let Some(ref mut off) = dst_offset {
+        **off = current_dst_off;
     }
 
     Ok(copied_total)
@@ -442,40 +635,54 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
     let header = BDiffHeader::read_from(&mut diff_in)?;
 
     // Create target file (either as reflink copy of base or empty sparse file)
-    let target = File::options()
-        .write(true)
-        .create(true)
-        .open(target_file)
-        .map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!("Failed to create target file '{}': {}", target_file, e),
-            )
-        })?;
-
     if let Some(base) = base_file {
         // Create as reflink copy of base
-        let src = File::open(base).map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!("Failed to open base file '{}': {}", base, e),
-            )
-        })?;
-        let total_len = src.metadata()?.len() as usize;
-        let copied = copy_range(src.as_raw_fd(), None, target.as_raw_fd(), None, total_len)?;
-
-        if copied != total_len {
-            return Err(Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("Failed to create target file {} as copy of base file {}: copied {} bytes, expected {}", 
-                    target_file, base, copied, total_len)
-            ));
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS, use clonefile for CoW copy
+            clone_file(base, target_file)?;
+            println!(
+                "Initialized target file as CoW clone of base file at: {}",
+                target_file
+            );
         }
 
-        println!(
-            "Initialized target file as reflink copy of base file at: {}",
-            target_file
-        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            // On Linux, use copy_file_range
+            let src = File::open(base).map_err(|e| {
+                Error::new(
+                    e.kind(),
+                    format!("Failed to open base file '{}': {}", base, e),
+                )
+            })?;
+            let target = File::options()
+                .write(true)
+                .create(true)
+                .open(target_file)
+                .map_err(|e| {
+                    Error::new(
+                        e.kind(),
+                        format!("Failed to create target file '{}': {}", target_file, e),
+                    )
+                })?;
+
+            let total_len = src.metadata()?.len() as usize;
+            let copied = copy_range(src.as_raw_fd(), None, target.as_raw_fd(), None, total_len)?;
+
+            if copied != total_len {
+                return Err(Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("Failed to create target file {} as copy of base file {}: copied {} bytes, expected {}",
+                        target_file, base, copied, total_len)
+                ));
+            }
+
+            println!(
+                "Initialized target file as reflink copy of base file at: {}",
+                target_file
+            );
+        }
 
         // Check if target size differs from base size and resize if needed
         if header.target_size != header.base_size {
@@ -484,10 +691,23 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
                 format_size(header.base_size),
                 format_size(header.target_size)
             );
+            let target = File::options()
+                .write(true)
+                .open(target_file)?;
             target.set_len(header.target_size)?;
         }
     } else {
         // Create empty sparse file of target size
+        let target = File::options()
+            .write(true)
+            .create(true)
+            .open(target_file)
+            .map_err(|e| {
+                Error::new(
+                    e.kind(),
+                    format!("Failed to create target file '{}': {}", target_file, e),
+                )
+            })?;
         target.set_len(header.target_size)?;
         println!(
             "Initialized target file as empty sparse file of size {} at: {}",
@@ -501,6 +721,17 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))? as usize;
     let padding_size = (BLOCK_SIZE - (header_size % BLOCK_SIZE)) % BLOCK_SIZE;
     diff_in.seek(std::io::SeekFrom::Current(padding_size as i64))?;
+
+    // Open target file for writing the diff ranges
+    let target = File::options()
+        .write(true)
+        .open(target_file)
+        .map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("Failed to open target file '{}' for writing: {}", target_file, e),
+            )
+        })?;
 
     // Apply each range
     for range in header.ranges {
@@ -516,7 +747,7 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
         if copied != range.length as usize {
             return Err(Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("Failed to copy all requested bytes for range {:?}: copied {} bytes, expected {}", 
+                format!("Failed to copy all requested bytes for range {:?}: copied {} bytes, expected {}",
                     range, copied, range.length)
             ));
         }
@@ -602,7 +833,7 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
     } else {
         println!("File: {}", input_file);
 
-        let mut extents: Vec<_> = fiemap::fiemap(input_file)?.collect::<Result<Vec<_>, _>>()?;
+        let mut extents = get_extents(input_file)?;
         extents.sort_by_key(|e| e.fe_logical);
 
         let total_size: u64 = extents.iter().map(|e| e.fe_length).sum();
@@ -624,14 +855,14 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
                 for i in start_idx..end_idx {
                     let extent = &extents[i];
                     println!(
-                        "  {}{}: logical={:#x} physical={:#x} length={:#x} ({}) flags={:?}",
+                        "  {}{}: logical={:#x} physical={:#x} length={:#x} ({}) shared={}",
                         if i == idx { ">" } else { " " },
                         i,
                         extent.fe_logical,
                         extent.fe_physical,
                         extent.fe_length,
                         format_size(extent.fe_length),
-                        extent.fe_flags
+                        extent.is_shared
                     );
                 }
             } else {
@@ -641,13 +872,13 @@ fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error>
             // Show all extents when no filter
             for (i, extent) in extents.iter().enumerate() {
                 println!(
-                    "  {}: logical={:#x} physical={:#x} length={:#x} ({}) flags={:?}",
+                    "  {}: logical={:#x} physical={:#x} length={:#x} ({}) shared={}",
                     i,
                     extent.fe_logical,
                     extent.fe_physical,
                     extent.fe_length,
                     format_size(extent.fe_length),
-                    extent.fe_flags
+                    extent.is_shared
                 );
             }
         }
